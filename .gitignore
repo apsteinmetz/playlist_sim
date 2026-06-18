@@ -1,0 +1,22 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Local environments and credentials
+.Renviron
+renv/library/
+renv/staging/
+
+# Generated and local data
+data/playlists.parquet
+data/raw/*
+data/processed/*
+data/cache/*
+output/*
+
+# Keep project directories in Git
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/cache/.gitkeep
+!output/.gitkeep

@@ -1,0 +1,5 @@
+# Create a Spotify developer application and copy its credentials here.
+# Never commit the real .Renviron file.
+SPOTIFY_CLIENT_ID=replace_me
+SPOTIFY_CLIENT_SECRET=replace_me
+
