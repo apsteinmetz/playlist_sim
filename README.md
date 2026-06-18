@@ -64,3 +64,24 @@ The script uses a descriptive user agent, sends no more than one request per
 failures with backoff. MusicBrainz IDs can be joined to the frozen
 AcousticBrainz feature dumps; MusicBrainz itself does not provide audio
 features.
+
+## Compare two DJs
+
+The DJ similarity function lives in `R/dj_similarity.R`. It compares two
+feature tables as distributions over the matched ReccoBeats features and
+returns an index from 0 to 100, plus component scores for:
+
+- overall feature-shape similarity
+- centroid similarity
+- spread similarity
+- nearest-neighbor similarity
+
+Run the current pair with:
+
+```r
+Rscript --vanilla -e "source('scripts/score_dj_similarity.R', echo = FALSE)"
+```
+
+The runner reads `data/processed/playlist_1_features.csv` and
+`data/processed/playlist_2_features.csv` and writes
+`output/dj_similarity_summary.csv`.
