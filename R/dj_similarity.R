@@ -10,9 +10,11 @@ dj_similarity_feature_columns <- function() {
 }
 
 read_similarity_input <- function(x) {
-  if (is.data.frame(x)) return(as.data.frame(x, stringsAsFactors = FALSE))
+  if (is.data.frame(x)) {
+    return(as.data.frame(x, stringsAsFactors = FALSE))
+  }
   if (is.character(x) && length(x) == 1L && file.exists(x)) {
-    return(utils::read.csv(x, stringsAsFactors = FALSE, check.names = FALSE))
+    return(readr::read_csv(x, show_col_types = FALSE))
   }
   stop("Input must be a data frame or an existing CSV file path.", call. = FALSE)
 }
@@ -31,27 +33,33 @@ similarity_require_columns <- function(df) {
 
 similarity_reference_stats <- function(df) {
   df <- similarity_require_columns(df)
-  stats <- list()
+
   numeric_cols <- c(
     "acousticness", "danceability", "energy", "instrumentalness",
     "liveness", "speechiness", "valence", "loudness"
   )
-  for (column in numeric_cols) {
-    stats[[column]] <- list(
-      mean = mean(df[[column]], na.rm = TRUE),
-      sd = stats::sd(df[[column]], na.rm = TRUE)
+
+  stats_tbl <- tibble::tibble(column = numeric_cols) |>
+    dplyr::mutate(
+      mean = purrr::map_dbl(column, ~ mean(df[[.x]], na.rm = TRUE)),
+      sd = purrr::map_dbl(column, ~ stats::sd(df[[.x]], na.rm = TRUE)),
+      sd = dplyr::if_else(is.finite(sd) & sd != 0, sd, 1)
     )
-    if (!is.finite(stats[[column]]$sd) || stats[[column]]$sd == 0) {
-      stats[[column]]$sd <- 1
-    }
-  }
+
+  stats <- purrr::map2(stats_tbl$mean, stats_tbl$sd, function(mean, sd) {
+    list(mean = mean, sd = sd)
+  }) |>
+    stats::setNames(stats_tbl$column)
+
   tempo_log2 <- log2(pmax(df$tempo, .Machine$double.eps))
-  stats$tempo <- list(
+  tempo_stats <- list(
     mean = mean(tempo_log2, na.rm = TRUE),
     sd = stats::sd(tempo_log2, na.rm = TRUE)
   )
-  if (!is.finite(stats$tempo$sd) || stats$tempo$sd == 0) stats$tempo$sd <- 1
-  stats$tempo_anchor <- stats$tempo$mean
+  if (!is.finite(tempo_stats$sd) || tempo_stats$sd == 0) tempo_stats$sd <- 1
+
+  stats$tempo <- tempo_stats
+  stats$tempo_anchor <- tempo_stats$mean
   stats
 }
 
@@ -68,43 +76,57 @@ prepare_similarity_matrix <- function(df, reference_stats = NULL) {
   tempo_log2 <- log2(pmax(df$tempo, .Machine$double.eps))
   tempo_folded <- tempo_log2 - round(tempo_log2 - reference_stats$tempo_anchor)
 
-  matrix_data <- data.frame(
+  matrix_data <- tibble::tibble(
     acousticness = scale_with_reference(
-      df$acousticness, reference_stats$acousticness$mean,
+      df$acousticness,
+      reference_stats$acousticness$mean,
       reference_stats$acousticness$sd
     ),
     danceability = scale_with_reference(
-      df$danceability, reference_stats$danceability$mean,
+      df$danceability,
+      reference_stats$danceability$mean,
       reference_stats$danceability$sd
     ),
     energy = scale_with_reference(
-      df$energy, reference_stats$energy$mean, reference_stats$energy$sd
+      df$energy,
+      reference_stats$energy$mean,
+      reference_stats$energy$sd
     ),
     instrumentalness = scale_with_reference(
-      df$instrumentalness, reference_stats$instrumentalness$mean,
+      df$instrumentalness,
+      reference_stats$instrumentalness$mean,
       reference_stats$instrumentalness$sd
     ),
     liveness = scale_with_reference(
-      df$liveness, reference_stats$liveness$mean, reference_stats$liveness$sd
+      df$liveness,
+      reference_stats$liveness$mean,
+      reference_stats$liveness$sd
     ),
     speechiness = scale_with_reference(
-      df$speechiness, reference_stats$speechiness$mean,
+      df$speechiness,
+      reference_stats$speechiness$mean,
       reference_stats$speechiness$sd
     ),
     valence = scale_with_reference(
-      df$valence, reference_stats$valence$mean, reference_stats$valence$sd
+      df$valence,
+      reference_stats$valence$mean,
+      reference_stats$valence$sd
     ),
     loudness = scale_with_reference(
-      df$loudness, reference_stats$loudness$mean, reference_stats$loudness$sd
+      df$loudness,
+      reference_stats$loudness$mean,
+      reference_stats$loudness$sd
     ),
     tempo = scale_with_reference(
-      tempo_folded, reference_stats$tempo_anchor, reference_stats$tempo$sd
+      tempo_folded,
+      reference_stats$tempo_anchor,
+      reference_stats$tempo$sd
     ),
     mode = as.numeric(df$mode),
     key_sin = sin(key_angle),
-    key_cos = cos(key_angle),
-    stringsAsFactors = FALSE
+    key_cos = cos(key_angle)
   )
+
   as.matrix(matrix_data)
 }
 
@@ -156,11 +178,12 @@ compute_dj_similarity <- function(dj_a, dj_b, reference_data = NULL) {
   similarity_require_columns(dj_a)
   similarity_require_columns(dj_b)
 
-  if (is.null(reference_data)) {
-    reference_data <- rbind(dj_a, dj_b)
+  reference_data <- if (is.null(reference_data)) {
+    dplyr::bind_rows(dj_a, dj_b)
   } else {
-    reference_data <- read_similarity_input(reference_data)
+    read_similarity_input(reference_data)
   }
+
   reference_stats <- similarity_reference_stats(reference_data)
 
   matrix_a <- prepare_similarity_matrix(dj_a, reference_stats)
@@ -178,7 +201,9 @@ compute_dj_similarity <- function(dj_a, dj_b, reference_data = NULL) {
 
   overall_similarity <- stats::weighted.mean(
     c(
-      shape_similarity, centroid_similarity, spread_similarity,
+      shape_similarity,
+      centroid_similarity,
+      spread_similarity,
       nearest_similarity
     ),
     c(0.55, 0.15, 0.10, 0.20),

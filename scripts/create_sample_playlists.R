@@ -16,6 +16,17 @@ if (!requireNamespace("nanoparquet", quietly = TRUE)) {
   )
 }
 
+required_packages <- c("dplyr", "readr", "stringr", "tidyr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Missing packages: ", paste(missing_packages, collapse = ", "), ".",
+    call. = FALSE
+  )
+}
+
 args <- commandArgs(trailingOnly = TRUE)
 seed <- if (length(args) >= 1L) as.integer(args[[1L]]) else 20260618L
 
@@ -46,28 +57,29 @@ if (length(missing_columns) > 0L) {
   )
 }
 
-text_columns <- c("DJ", "Artist", "Title")
-playlists[text_columns] <- lapply(playlists[text_columns], trimws)
-complete_rows <- stats::complete.cases(playlists[required_columns]) &
-  playlists$DJ != "" & playlists$Artist != "" & playlists$Title != ""
-playlists <- playlists[complete_rows, required_columns, drop = FALSE]
+playlists <- playlists |>
+  dplyr::mutate(
+    dplyr::across(c("DJ", "Artist", "Title"), stringr::str_trim)
+  ) |>
+  tidyr::drop_na(dplyr::all_of(required_columns)) |>
+  dplyr::filter(
+    DJ != "",
+    Artist != "",
+    Title != ""
+  ) |>
+  dplyr::mutate(
+    AirDate_num = as.numeric(AirDate),
+    track_key = paste(tolower(DJ), tolower(Artist), tolower(Title), sep = "\r")
+  ) |>
+  # Sort first so repeated songs retain their most recent airdate.
+  dplyr::arrange(DJ, dplyr::desc(AirDate_num)) |>
+  dplyr::distinct(track_key, .keep_all = TRUE) |>
+  dplyr::select(dplyr::all_of(required_columns))
 
-# Sort first so repeated songs retain their most recent airdate.
-playlists <- playlists[
-  order(playlists$DJ, -as.numeric(playlists$AirDate)),
-  ,
-  drop = FALSE
-]
-track_key <- paste(
-  tolower(playlists$DJ),
-  tolower(playlists$Artist),
-  tolower(playlists$Title),
-  sep = "\r"
-)
-playlists <- playlists[!duplicated(track_key), , drop = FALSE]
-
-tracks_per_dj <- table(playlists$DJ)
-eligible_djs <- names(tracks_per_dj[tracks_per_dj >= sample_size])
+eligible_djs <- playlists |>
+  dplyr::count(DJ, name = "track_count") |>
+  dplyr::filter(track_count >= sample_size) |>
+  dplyr::pull(DJ)
 
 if (length(eligible_djs) < 2L) {
   stop(
@@ -81,30 +93,19 @@ set.seed(seed)
 selected_djs <- sample(eligible_djs, size = 2L, replace = FALSE)
 
 for (i in seq_along(selected_djs)) {
-  dj_tracks <- playlists[playlists$DJ == selected_djs[[i]], , drop = FALSE]
-  dj_tracks <- dj_tracks[
-    order(dj_tracks$AirDate, decreasing = TRUE),
-    ,
-    drop = FALSE
-  ]
-  recent_tracks <- utils::head(dj_tracks, sample_size)
-  randomized_rows <- sample.int(
-    nrow(recent_tracks),
-    size = nrow(recent_tracks),
-    replace = FALSE
-  )
-  sample_playlist <- recent_tracks[randomized_rows, , drop = FALSE]
+  sample_playlist <- playlists |>
+    dplyr::filter(DJ == selected_djs[[i]]) |>
+    dplyr::arrange(dplyr::desc(AirDate)) |>
+    dplyr::slice_head(n = sample_size) |>
+    dplyr::slice_sample(prop = 1)
 
-  utils::write.csv(sample_playlist, output_paths[[i]], row.names = FALSE)
+  readr::write_csv(sample_playlist, output_paths[[i]])
 }
 
-message("Seed: ", seed)
-message(
-  "Playlist 1 DJ: ", selected_djs[[1L]],
-  " (1,000 most recent tracks, randomized order)"
+tibble::tibble(
+  seed = seed,
+  playlist_1_dj = selected_djs[[1L]],
+  playlist_2_dj = selected_djs[[2L]],
+  output_1 = output_paths[[1L]],
+  output_2 = output_paths[[2L]]
 )
-message(
-  "Playlist 2 DJ: ", selected_djs[[2L]],
-  " (1,000 most recent tracks, randomized order)"
-)
-message("Wrote: ", paste(output_paths, collapse = ", "))

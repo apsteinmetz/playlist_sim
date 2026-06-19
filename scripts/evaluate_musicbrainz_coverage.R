@@ -1,7 +1,10 @@
-#!/usr/bin/env Rscript
-
-# Evaluate artist/title resolution through the MusicBrainz recording search API.
-# MusicBrainz supplies identifiers and metadata, not acoustic features. Matched
+  query <- paste0(
+    'recording:\"',
+    lucene_quote(results$Title[[i]]),
+    '\" AND artist:\"',
+    lucene_quote(results$Artist[[i]]),
+    '\"'
+  ) and metadata, not acoustic features. Matched
 # recording MBIDs can subsequently be joined to the AcousticBrainz data dumps.
 
 project_library <- file.path("renv", "library")
@@ -9,7 +12,7 @@ if (dir.exists(project_library)) {
   .libPaths(c(normalizePath(project_library), .libPaths()))
 }
 
-required_packages <- c("curl", "jsonlite")
+required_packages <- c("curl", "jsonlite", "dplyr", "purrr", "readr", "stringr", "tibble")
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
@@ -26,10 +29,13 @@ if (length(missing_packages) > 0L) {
 }
 
 normalize_text <- function(x) {
-  x <- tolower(trimws(x %||% ""))
-  x <- gsub("&", " and ", x, fixed = TRUE)
-  x <- gsub("[^[:alnum:]]+", " ", x)
-  gsub("\\s+", " ", trimws(x))
+  x |>
+    (`%||%`)("") |>
+    stringr::str_to_lower() |>
+    stringr::str_trim() |>
+    stringr::str_replace_all("&", " and ") |>
+    stringr::str_replace_all("[^[:alnum:]]+", " ") |>
+    stringr::str_squish()
 }
 
 text_similarity <- function(x, y) {
@@ -99,8 +105,10 @@ musicbrainz_get <- function(url, cache_file, max_attempts = 5L) {
     if (inherits(response, "error")) {
       if (attempt == max_attempts) {
         return(list(
-          ok = FALSE, status = NA_integer_,
-          error = conditionMessage(response), body = NULL
+          ok = FALSE,
+          status = NA_integer_,
+          error = conditionMessage(response),
+          body = NULL
         ))
       }
       Sys.sleep(min(60, 2^(attempt - 1L)) + stats::runif(1L, 0, 0.25))
@@ -123,11 +131,7 @@ musicbrainz_get <- function(url, cache_file, max_attempts = 5L) {
       retry_after <- suppressWarnings(as.numeric(
         header_value(response$headers, "Retry-After") %||% NA_character_
       ))
-      wait_seconds <- if (is.na(retry_after)) {
-        min(60, 2^(attempt - 1L))
-      } else {
-        retry_after
-      }
+      wait_seconds <- if (is.na(retry_after)) min(60, 2^(attempt - 1L)) else retry_after
       Sys.sleep(max(1.1, wait_seconds) + stats::runif(1L, 0, 0.25))
       next
     }
@@ -138,54 +142,79 @@ musicbrainz_get <- function(url, cache_file, max_attempts = 5L) {
     }
 
     return(list(
-      ok = FALSE, status = status, error = paste("HTTP", status), body = body
+      ok = FALSE,
+      status = status,
+      error = paste("HTTP", status),
+      body = body
     ))
   }
 }
 
 artist_credit_text <- function(recording) {
   credits <- recording[["artist-credit"]] %||% list()
-  names <- vapply(credits, function(credit) {
-    credit$name %||% credit$artist$name %||% ""
-  }, character(1))
+  names <- purrr::map_chr(credits, ~ .x$name %||% .x$artist$name %||% "")
   paste(names[nzchar(names)], collapse = "; ")
 }
 
 score_recordings <- function(recordings, artist, title) {
   if (length(recordings) == 0L) return(NULL)
-  rows <- lapply(recordings, function(recording) {
+
+  purrr::map_dfr(recordings, function(recording) {
     matched_artist <- artist_credit_text(recording)
     matched_title <- recording$title %||% ""
+
     artist_score <- text_similarity(matched_artist, artist)
     title_score <- text_similarity(matched_title, title)
     search_score <- as.numeric(recording$score %||% 0) / 100
-    data.frame(
+
+    tibble::tibble(
       musicbrainz_recording_id = recording$id %||% NA_character_,
       matched_artist = matched_artist,
       matched_title = matched_title,
       artist_score = artist_score,
       title_score = title_score,
       search_score = search_score,
-      match_score = 0.35 * artist_score + 0.50 * title_score + 0.15 * search_score,
-      stringsAsFactors = FALSE
+      match_score = 0.35 * artist_score + 0.50 * title_score + 0.15 * search_score
     )
   })
-  do.call(rbind, rows)
 }
 
 classify_match <- function(scored) {
   if (is.null(scored) || nrow(scored) == 0L) return("missing")
-  scored <- scored[order(-scored$match_score), , drop = FALSE]
-  exact <- scored$title_score >= 0.98 & scored$artist_score >= 0.98
-  exact_ids <- unique(scored$musicbrainz_recording_id[exact])
+
+  ranked <- scored |>
+    dplyr::arrange(dplyr::desc(match_score))
+
+  exact_ids <- ranked |>
+    dplyr::filter(title_score >= 0.98, artist_score >= 0.98) |>
+    dplyr::pull(musicbrainz_recording_id) |>
+    unique()
+
   if (length(exact_ids) == 1L) return("exact")
   if (length(exact_ids) > 1L) return("ambiguous")
 
-  second_score <- if (nrow(scored) >= 2L) scored$match_score[[2L]] else 0
-  margin <- scored$match_score[[1L]] - second_score
-  if (scored$match_score[[1L]] >= 0.85 && margin >= 0.08) return("matched")
-  if (scored$match_score[[1L]] >= 0.70) return("ambiguous")
+  second_score <- if (nrow(ranked) >= 2L) ranked$match_score[[2L]] else 0
+  margin <- ranked$match_score[[1L]] - second_score
+
+  if (ranked$match_score[[1L]] >= 0.85 && margin >= 0.08) return("matched")
+  if (ranked$match_score[[1L]] >= 0.70) return("ambiguous")
   "missing"
+}
+
+summarize_coverage <- function(x, label) {
+  usable <- x$musicbrainz_status %in% c("exact", "matched")
+
+  tibble::tibble(
+    playlist = label,
+    total_tracks = nrow(x),
+    exact = sum(x$musicbrainz_status == "exact", na.rm = TRUE),
+    matched = sum(x$musicbrainz_status == "matched", na.rm = TRUE),
+    ambiguous = sum(x$musicbrainz_status == "ambiguous", na.rm = TRUE),
+    missing = sum(x$musicbrainz_status == "missing", na.rm = TRUE),
+    errors = sum(stringr::str_detect(x$musicbrainz_status, "^error_"), na.rm = TRUE),
+    usable_recording_ids = sum(usable, na.rm = TRUE),
+    usable_resolution_pct = round(100 * sum(usable, na.rm = TRUE) / nrow(x), 1)
+  )
 }
 
 input_paths <- file.path("data", c("playlist_1.csv", "playlist_2.csv"))
@@ -198,16 +227,16 @@ dir.create(file.path("data", "cache", "musicbrainz"), recursive = TRUE,
            showWarnings = FALSE)
 dir.create("output", showWarnings = FALSE)
 
-playlist_rows <- do.call(rbind, lapply(input_paths, function(path) {
-  x <- utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+playlist_rows <- purrr::map_dfr(input_paths, function(path) {
+  x <- readr::read_csv(path, show_col_types = FALSE)
   needed <- c("DJ", "Artist", "Title")
   if (!all(needed %in% names(x))) {
     stop(path, " must contain DJ, Artist, and Title columns.", call. = FALSE)
   }
-  x$playlist <- tools::file_path_sans_ext(basename(path))
-  x[c("playlist", needed)]
-}))
-row.names(playlist_rows) <- NULL
+  x |>
+    dplyr::mutate(playlist = tools::file_path_sans_ext(basename(path))) |>
+    dplyr::select(playlist, dplyr::all_of(needed))
+})
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) >= 1L) {
@@ -215,20 +244,23 @@ if (length(args) >= 1L) {
   if (is.na(requested_limit) || requested_limit < 1L) {
     stop("The optional track limit must be a positive integer.", call. = FALSE)
   }
-  playlist_rows <- utils::head(playlist_rows, requested_limit)
+  playlist_rows <- playlist_rows |>
+    dplyr::slice_head(n = requested_limit)
 }
 
-results <- playlist_rows
-results$musicbrainz_status <- NA_character_
-results$musicbrainz_recording_id <- NA_character_
-results$matched_artist <- NA_character_
-results$matched_title <- NA_character_
-results$artist_score <- NA_real_
-results$title_score <- NA_real_
-results$search_score <- NA_real_
-results$match_score <- NA_real_
-results$candidate_count <- NA_integer_
-results$exact_candidate_count <- NA_integer_
+results <- playlist_rows |>
+  dplyr::mutate(
+    musicbrainz_status = NA_character_,
+    musicbrainz_recording_id = NA_character_,
+    matched_artist = NA_character_,
+    matched_title = NA_character_,
+    artist_score = NA_real_,
+    title_score = NA_real_,
+    search_score = NA_real_,
+    match_score = NA_real_,
+    candidate_count = NA_integer_,
+    exact_candidate_count = NA_integer_
+  )
 
 message("Searching MusicBrainz for ", nrow(results), " tracks...")
 for (i in seq_len(nrow(results))) {
@@ -247,9 +279,7 @@ for (i in seq_len(nrow(results))) {
   )
 
   if (!response$ok) {
-    results$musicbrainz_status[[i]] <- paste0(
-      "error_", response$status %||% "network"
-    )
+    results$musicbrainz_status[[i]] <- paste0("error_", response$status %||% "network")
     message(
       "  MusicBrainz request ", i, " failed: ",
       results$musicbrainz_status[[i]], " (", response$error %||% "unknown", ")"
@@ -263,15 +293,18 @@ for (i in seq_len(nrow(results))) {
   results$exact_candidate_count[[i]] <- if (is.null(scored)) {
     0L
   } else {
-    length(unique(scored$musicbrainz_recording_id[
-      scored$title_score >= 0.98 & scored$artist_score >= 0.98
-    ]))
+    scored |>
+      dplyr::filter(title_score >= 0.98, artist_score >= 0.98) |>
+      dplyr::pull(musicbrainz_recording_id) |>
+      unique() |>
+      length()
   }
   results$musicbrainz_status[[i]] <- classify_match(scored)
 
   if (!is.null(scored) && nrow(scored) > 0L) {
-    scored <- scored[order(-scored$match_score), , drop = FALSE]
-    best <- scored[1L, , drop = FALSE]
+    best <- scored |>
+      dplyr::arrange(dplyr::desc(match_score)) |>
+      dplyr::slice(1)
     for (column in c(
       "musicbrainz_recording_id", "matched_artist", "matched_title",
       "artist_score", "title_score", "search_score", "match_score"
@@ -283,40 +316,12 @@ for (i in seq_len(nrow(results))) {
   if (i %% 10L == 0L) message("  MusicBrainz: ", i, "/", nrow(results))
 }
 
-summarize_coverage <- function(x, label) {
-  usable <- x$musicbrainz_status %in% c("exact", "matched")
-  data.frame(
-    playlist = label,
-    total_tracks = nrow(x),
-    exact = sum(x$musicbrainz_status == "exact", na.rm = TRUE),
-    matched = sum(x$musicbrainz_status == "matched", na.rm = TRUE),
-    ambiguous = sum(x$musicbrainz_status == "ambiguous", na.rm = TRUE),
-    missing = sum(x$musicbrainz_status == "missing", na.rm = TRUE),
-    errors = sum(grepl("^error_", x$musicbrainz_status)),
-    usable_recording_ids = sum(usable, na.rm = TRUE),
-    usable_resolution_pct = round(100 * sum(usable, na.rm = TRUE) / nrow(x), 1),
-    stringsAsFactors = FALSE
-  )
-}
+coverage_summary <- results |>
+  dplyr::group_split(playlist, .keep = TRUE) |>
+  purrr::map_dfr(~ summarize_coverage(.x, unique(.x$playlist))) |>
+  dplyr::bind_rows(summarize_coverage(results, "overall"))
 
-summary_rows <- lapply(split(results, results$playlist), function(x) {
-  summarize_coverage(x, unique(x$playlist))
-})
-summary_rows[[length(summary_rows) + 1L]] <- summarize_coverage(results, "overall")
-coverage_summary <- do.call(rbind, summary_rows)
-row.names(coverage_summary) <- NULL
+readr::write_csv(results, file.path("output", "musicbrainz_coverage_detail.csv"))
+readr::write_csv(coverage_summary, file.path("output", "musicbrainz_coverage_summary.csv"))
 
-utils::write.csv(
-  results,
-  file.path("output", "musicbrainz_coverage_detail.csv"),
-  row.names = FALSE
-)
-utils::write.csv(
-  coverage_summary,
-  file.path("output", "musicbrainz_coverage_summary.csv"),
-  row.names = FALSE
-)
-
-print(coverage_summary, row.names = FALSE)
-message("Wrote output/musicbrainz_coverage_detail.csv")
-message("Wrote output/musicbrainz_coverage_summary.csv")
+coverage_summary
