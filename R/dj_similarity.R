@@ -9,6 +9,27 @@ dj_similarity_feature_columns <- function() {
   )
 }
 
+dj_profile_feature_columns <- function() {
+  c(
+    "acousticness_mean", "acousticness_sd",
+    "danceability_mean", "danceability_sd",
+    "energy_mean", "energy_sd",
+    "instrumentalness_mean", "instrumentalness_sd",
+    "liveness_mean", "liveness_sd",
+    "speechiness_mean", "speechiness_sd",
+    "valence_mean", "valence_sd",
+    "loudness_mean", "loudness_sd",
+    "tempo_mean", "tempo_sd",
+    "key_sin_mean", "key_cos_mean",
+    "mode_mean",
+    "tracks_matched"
+  )
+}
+
+dj_profile_similarity_columns <- function() {
+  setdiff(dj_profile_feature_columns(), "tracks_matched")
+}
+
 read_similarity_input <- function(x) {
   if (is.data.frame(x)) {
     return(as.data.frame(x, stringsAsFactors = FALSE))
@@ -228,5 +249,129 @@ compute_dj_similarity <- function(dj_a, dj_b, reference_data = NULL) {
       tracks_a = nrow(dj_a),
       tracks_b = nrow(dj_b)
     )
+  )
+}
+
+normalize_track_key <- function(artist, title) {
+  track_key <- paste(tolower(trimws(artist)), tolower(trimws(title)), sep = "\r")
+  dplyr::na_if(track_key, "\r")
+}
+
+build_dj_profiles <- function(roster, master_features) {
+  roster <- read_similarity_input(roster) |>
+    dplyr::as_tibble()
+  master_features <- read_similarity_input(master_features) |>
+    dplyr::as_tibble()
+
+  required_roster <- c("DJ", "Artist", "Title")
+  missing_roster <- setdiff(required_roster, names(roster))
+  if (length(missing_roster) > 0L) {
+    stop(
+      "Roster is missing required columns: ",
+      paste(missing_roster, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  if (!"track_key" %in% names(roster)) {
+    roster <- roster |>
+      dplyr::mutate(track_key = normalize_track_key(Artist, Title))
+  }
+
+  if (!"track_key" %in% names(master_features)) {
+    stop("Master features must include a `track_key` column.", call. = FALSE)
+  }
+
+  feature_rows <- roster |>
+    dplyr::select(DJ, track_key) |>
+    dplyr::filter(!is.na(track_key)) |>
+    dplyr::distinct() |>
+    dplyr::inner_join(master_features, by = "track_key") |>
+    dplyr::filter(dplyr::if_all(dplyr::all_of(dj_similarity_feature_columns()), ~ !is.na(.x)))
+
+  if (nrow(feature_rows) == 0L) {
+    stop("No overlapping roster tracks were found in the master feature table.", call. = FALSE)
+  }
+
+  feature_rows |>
+    dplyr::mutate(
+      key_index = as.numeric(key) %% 12,
+      key_angle = 2 * pi * key_index / 12
+    ) |>
+    dplyr::group_by(DJ) |>
+    dplyr::summarise(
+      tracks_matched = dplyr::n(),
+      acousticness_mean = mean(acousticness, na.rm = TRUE),
+      acousticness_sd = stats::sd(acousticness, na.rm = TRUE),
+      danceability_mean = mean(danceability, na.rm = TRUE),
+      danceability_sd = stats::sd(danceability, na.rm = TRUE),
+      energy_mean = mean(energy, na.rm = TRUE),
+      energy_sd = stats::sd(energy, na.rm = TRUE),
+      instrumentalness_mean = mean(instrumentalness, na.rm = TRUE),
+      instrumentalness_sd = stats::sd(instrumentalness, na.rm = TRUE),
+      liveness_mean = mean(liveness, na.rm = TRUE),
+      liveness_sd = stats::sd(liveness, na.rm = TRUE),
+      speechiness_mean = mean(speechiness, na.rm = TRUE),
+      speechiness_sd = stats::sd(speechiness, na.rm = TRUE),
+      valence_mean = mean(valence, na.rm = TRUE),
+      valence_sd = stats::sd(valence, na.rm = TRUE),
+      loudness_mean = mean(loudness, na.rm = TRUE),
+      loudness_sd = stats::sd(loudness, na.rm = TRUE),
+      tempo_mean = mean(tempo, na.rm = TRUE),
+      tempo_sd = stats::sd(tempo, na.rm = TRUE),
+      key_sin_mean = mean(sin(key_angle), na.rm = TRUE),
+      key_cos_mean = mean(cos(key_angle), na.rm = TRUE),
+      mode_mean = mean(as.numeric(mode), na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::ends_with("_sd"),
+        ~ dplyr::if_else(is.finite(.x) & .x != 0, .x, 1)
+      )
+    )
+}
+
+compute_profile_similarity_matrix <- function(profiles) {
+  profiles <- read_similarity_input(profiles) |>
+    dplyr::as_tibble()
+
+  missing <- setdiff(dj_profile_feature_columns(), names(profiles))
+  if (length(missing) > 0L) {
+    stop(
+      "Profiles are missing required columns: ",
+      paste(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  feature_matrix <- profiles |>
+    dplyr::select(dplyr::all_of(dj_profile_similarity_columns())) |>
+    data.matrix()
+  centers <- colMeans(feature_matrix, na.rm = TRUE)
+  spreads <- apply(feature_matrix, 2L, stats::sd, na.rm = TRUE)
+  spreads[!is.finite(spreads) | spreads == 0] <- 1
+  feature_matrix <- sweep(feature_matrix, 2L, centers, "-")
+  feature_matrix <- sweep(feature_matrix, 2L, spreads, "/")
+  dj_names <- profiles$DJ
+  distance_object <- stats::dist(feature_matrix)
+  distance_matrix <- as.matrix(distance_object)
+  similarity_matrix <- 100 / (1 + distance_matrix)
+  diag(similarity_matrix) <- 100
+  rownames(similarity_matrix) <- dj_names
+  colnames(similarity_matrix) <- dj_names
+
+  similarity_long <- tibble::as_tibble(as.data.frame(as.table(similarity_matrix))) |>
+    dplyr::rename(DJ_A = Var1, DJ_B = Var2, similarity_index = Freq) |>
+    dplyr::mutate(
+      DJ_A = as.character(DJ_A),
+      DJ_B = as.character(DJ_B)
+    ) |>
+    dplyr::filter(DJ_A < DJ_B)
+
+  list(
+    similarity_matrix = similarity_matrix,
+    similarity_long = similarity_long,
+    distances = distance_matrix
   )
 }

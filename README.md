@@ -85,3 +85,26 @@ Rscript --vanilla -e "source('scripts/score_dj_similarity.R', echo = FALSE)"
 The runner reads `data/processed/playlist_1_features.csv` and
 `data/processed/playlist_2_features.csv` and writes
 `output/dj_similarity_summary.csv`.
+
+## All-DJ similarity
+
+For the full catalog workflow, use a 100-track-per-DJ roster and a shared
+master feature table:
+
+```r
+Rscript --vanilla scripts/create_dj_sample_roster.R
+Rscript --vanilla -e "source('scripts/build_master_track_features.R', echo = FALSE)"
+Rscript --vanilla -e "source('scripts/build_pairwise_dj_similarity.R', echo = FALSE)"
+```
+
+This produces:
+
+- `data/processed/dj_sample_roster.csv`
+- `data/processed/master_track_features.csv`
+- `data/processed/dj_profiles.csv`
+- `output/dj_pairwise_similarity.csv`
+- `output/dj_pairwise_similarity_matrix.csv`
+
+The pairwise scorer uses DJ-level profile vectors derived from the shared master
+feature table, so each unique track is fetched once and reused across all DJ
+comparisons.
